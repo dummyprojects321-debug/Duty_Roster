@@ -2,4 +2,5 @@ streamlit>=1.50.0
 pandas>=2.0
 openpyxl>=3.1
 reportlab>=4.0
-pyarrow<25
+pillow>=10.0
+numpy>=1.26
