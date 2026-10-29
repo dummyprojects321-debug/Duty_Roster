@@ -1216,24 +1216,65 @@ def _seed_from_excel(c):
             _upsert(c, stn, today_iso(), sid, "Duty", beat, shift, slot, squad, "seed")
 
 
+def _expected_columns() -> dict:
+    """Tables and columns that SCHEMA defines, read from a throw-away in-memory database."""
+    m = sqlite3.connect(":memory:")
+    m.executescript(SCHEMA)
+    out = {t: {r[1] for r in m.execute(f"PRAGMA table_info({t})")}
+           for (t,) in m.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+    m.close()
+    return out
+
+
+def _move_aside(reason: str) -> None:
+    dest = f"{DB_FILE}.legacy-{datetime.now():%Y%m%d%H%M%S}"
+    print(f"Database set aside ({reason}) -> {dest}")
+    shutil.move(DB_FILE, dest)
+
+
 def _set_aside_legacy_db():
-    """An old-format database (e.g. from the previous app version) is renamed, never overwritten."""
+    """An old-format or incompatible database is renamed, never overwritten."""
     if not os.path.exists(DB_FILE):
         return
     try:
         chk = sqlite3.connect(DB_FILE)
         tables = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        cols = {r[1] for r in chk.execute("PRAGMA table_info(users)")} if "users" in tables else set()
+        found = {t: {r[1] for r in chk.execute(f"PRAGMA table_info({t})")} for t in tables}
         chk.close()
     except sqlite3.DatabaseError:
-        tables, cols = {"?"}, set()
-    legacy = "employees" in tables or ("users" in tables and "role" not in cols) or tables == {"?"}
-    if legacy:
-        shutil.move(DB_FILE, f"{DB_FILE}.legacy-{datetime.now():%Y%m%d%H%M%S}")
+        _move_aside("unreadable file")
+        return
+    cols = found.get("users", set())
+    if "employees" in tables or ("users" in tables and "role" not in cols):
+        _move_aside("old app version")
+        return
+    for t, want in _expected_columns().items():      # same table name, different columns
+        if t in found and not want <= found[t]:
+            _move_aside(f"table '{t}' is missing {sorted(want - found[t])}")
+            return
 
 
 def init_db() -> bool:
-    _set_aside_legacy_db()
+    """Start-up with self-repair: a database the app cannot use is set aside and rebuilt,
+    and an unwritable folder (some cloud hosts) falls back to the system temp folder."""
+    global DB_FILE
+    for attempt in range(3):
+        try:
+            _set_aside_legacy_db()
+            return _init_db_once()
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            print(f"init_db attempt {attempt + 1} failed: {exc} (db={DB_FILE})")
+            if attempt == 0 and any(k in msg for k in ("readonly", "unable to open", "disk i/o")):
+                DB_FILE = os.path.join(tempfile.gettempdir(), "duty_roster_v3.db")
+            elif os.path.exists(DB_FILE):
+                _move_aside(str(exc))
+            else:
+                raise
+    raise RuntimeError("Could not initialise the database")
+
+
+def _init_db_once() -> bool:
     with db() as c:
         c.executescript(SCHEMA)
         if not c.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
