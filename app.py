@@ -56,7 +56,10 @@ STATE_TXT = {"final": "✅ Final", "draft": "🟡 Draft", "none": "🔴 Not crea
 # =============================================================================
 @st.cache_resource(show_spinner=False)
 def _boot():
-    return core.init_db()
+    try:
+        return core.init_db()
+    except Exception as exc:  # noqa: BLE001 - show the real reason; the host redacts uncaught errors
+        return f"{type(exc).__name__}: {exc}\n{core.diagnostics()}"
 
 
 @st.cache_data(show_spinner="Preparing PDF…", max_entries=40)
@@ -804,7 +807,14 @@ PAGES = {
 
 def main():
     st.markdown(CSS, unsafe_allow_html=True)
-    _boot()
+    boot = _boot()
+    if isinstance(boot, str):
+        st.error("Database could not start. Send this text to the developer:")
+        st.code(boot)
+        if st.button("Retry"):
+            _boot.clear()
+            st.rerun()
+        st.stop()
     user = st.session_state.get("user")
     if not user:
         login_view()

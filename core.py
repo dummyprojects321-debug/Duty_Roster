@@ -1216,10 +1216,35 @@ def _seed_from_excel(c):
             _upsert(c, stn, today_iso(), sid, "Duty", beat, shift, slot, squad, "seed")
 
 
+def _run_schema(conn) -> None:
+    """Run SCHEMA one statement at a time so a failure names the exact statement."""
+    buf = ""
+    for line in SCHEMA.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            try:
+                conn.execute(buf)
+            except sqlite3.Error as exc:
+                raise sqlite3.OperationalError(
+                    f"{exc} | SQLite {sqlite3.sqlite_version} | statement: {' '.join(buf.split())[:160]}") from exc
+            buf = ""
+
+
+def diagnostics() -> str:
+    """Plain-text facts for the on-screen error box (the host hides the real exception)."""
+    try:
+        size = os.path.getsize(DB_FILE) if os.path.exists(DB_FILE) else None
+    except OSError:
+        size = "?"
+    return (f"SQLite {sqlite3.sqlite_version} | db={DB_FILE} | exists_size={size} | "
+            f"dir_writable={os.access(os.path.dirname(DB_FILE) or '.', os.W_OK)} | "
+            f"core.py={os.path.abspath(__file__)}")
+
+
 def _expected_columns() -> dict:
     """Tables and columns that SCHEMA defines, read from a throw-away in-memory database."""
     m = sqlite3.connect(":memory:")
-    m.executescript(SCHEMA)
+    _run_schema(m)
     out = {t: {r[1] for r in m.execute(f"PRAGMA table_info({t})")}
            for (t,) in m.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
     m.close()
@@ -1276,7 +1301,7 @@ def init_db() -> bool:
 
 def _init_db_once() -> bool:
     with db() as c:
-        c.executescript(SCHEMA)
+        _run_schema(c)
         if not c.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
             _set_pw(c, ADMIN_USER, "admin", DEFAULT_ADMIN_PW, True)
         if not c.execute("SELECT 1 FROM users WHERE role='station'").fetchone():
