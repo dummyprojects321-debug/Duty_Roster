@@ -25,17 +25,23 @@ import secrets
 import shutil
 import sqlite3
 import tempfile
+import threading
+import warnings
 from contextlib import contextmanager
 from datetime import date, datetime
 from xml.sax.saxutils import escape
 
 import pandas as pd
 
+warnings.filterwarnings("ignore", message=".*only supports SQLAlchemy.*")
+
 # =============================================================================
 # CONFIG  (safe to edit)
 # =============================================================================
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.environ.get("DUTY_DB_PATH", os.path.join(HERE, "duty_roster_v3.db"))
+# Set DATABASE_URL (Postgres, e.g. Neon / Supabase) to keep data permanently; empty -> local SQLite file.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 SEED_FILE = os.path.join(HERE, "DUTY_ROSTER_Standard.xlsx")  # used once, on an empty database
 ORG_NAME = "PERA  |  DERB Gujranwala"
 APP_TITLE = "Duty Roster"
@@ -184,26 +190,162 @@ CREATE TABLE IF NOT EXISTS roster_day(
 CREATE TABLE IF NOT EXISTS signature(
     station TEXT PRIMARY KEY, label TEXT, officer TEXT, image BLOB);
 CREATE TABLE IF NOT EXISTS audit(
-    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, user TEXT, action TEXT, detail TEXT);
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, by_user TEXT, action TEXT, detail TEXT);
 """
+
+SCHEMA_PG = """
+CREATE TABLE IF NOT EXISTS users(
+    username TEXT PRIMARY KEY, role TEXT NOT NULL, salt TEXT, pw_hash TEXT,
+    must_change INTEGER DEFAULT 1, created_at TEXT);
+CREATE TABLE IF NOT EXISTS staff(
+    id SERIAL PRIMARY KEY, station TEXT NOT NULL, name TEXT NOT NULL,
+    designation TEXT DEFAULT '', belt_no TEXT DEFAULT '', contact TEXT DEFAULT '',
+    active INTEGER DEFAULT 1, created_at TEXT);
+CREATE INDEX IF NOT EXISTS ix_staff_station ON staff(station, active);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_staff_belt ON staff(belt_no) WHERE belt_no <> '';
+CREATE TABLE IF NOT EXISTS lists(
+    id SERIAL PRIMARY KEY, station TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_lists ON lists(station, kind, lower(name));
+CREATE TABLE IF NOT EXISTS slots(
+    id SERIAL PRIMARY KEY, station TEXT NOT NULL, t_start TEXT, t_end TEXT,
+    label TEXT NOT NULL, UNIQUE(station, label));
+CREATE TABLE IF NOT EXISTS roster(
+    id SERIAL PRIMARY KEY, station TEXT NOT NULL, roster_date TEXT NOT NULL,
+    staff_id INTEGER NOT NULL REFERENCES staff(id), status TEXT NOT NULL DEFAULT 'Duty',
+    beat TEXT DEFAULT '', shift TEXT DEFAULT '', slot TEXT DEFAULT '', remarks TEXT DEFAULT '',
+    updated_by TEXT, updated_at TEXT, UNIQUE(roster_date, staff_id));
+CREATE INDEX IF NOT EXISTS ix_roster_day ON roster(roster_date, station);
+CREATE TABLE IF NOT EXISTS roster_day(
+    station TEXT, roster_date TEXT, by_user TEXT, at TEXT, PRIMARY KEY(station, roster_date));
+CREATE TABLE IF NOT EXISTS signature(
+    station TEXT PRIMARY KEY, label TEXT, officer TEXT, image BYTEA);
+CREATE TABLE IF NOT EXISTS audit(
+    id SERIAL PRIMARY KEY, ts TEXT, by_user TEXT, action TEXT, detail TEXT);
+"""
+
+
+def using_pg() -> bool:
+    return bool(DATABASE_URL)
+
+
+def backend_name() -> str:
+    return "PostgreSQL (permanent)" if using_pg() else "SQLite file (temporary on cloud hosts)"
+
+
+def _tr(sql: str) -> str:
+    """SQLite-dialect SQL -> PostgreSQL."""
+    ignore = re.search(r"INSERT\s+OR\s+IGNORE\s+INTO", sql, re.I)
+    sql = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", sql, flags=re.I)
+    if ignore:
+        sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+    sql = re.sub(r"([A-Za-z_][\w.]*)\s+COLLATE\s+NOCASE", r"lower(\1)", sql, flags=re.I)
+    sql = re.sub(r"\bLIKE\b", "ILIKE", sql)
+    sql = sql.replace("ORDER BY rowid", "ORDER BY created_at, username")
+    return sql.replace("?", "%s")
+
+
+class _PgCursor:
+    def __init__(self, cur):
+        self._c = cur
+
+    def execute(self, sql, params=None):
+        self._c.execute(_tr(sql), list(params) if params else None)
+        return self
+
+    def __iter__(self):
+        return iter(self._c)
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
+class _PgConn:
+    """Gives a psycopg2 connection the small sqlite3-style surface the rest of the code uses."""
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def cursor(self):
+        return _PgCursor(self._raw.cursor())
+
+    def execute(self, sql, params=None):
+        return self.cursor().execute(sql, params)
+
+    def commit(self):
+        self._raw.commit()
+
+    def rollback(self):
+        self._raw.rollback()
+
+
+_POOL = None
+_POOL_LOCK = threading.Lock()
+
+
+def _pg_pool():
+    global _POOL
+    with _POOL_LOCK:
+        if _POOL is None:
+            import numpy as np
+            import psycopg2.extensions as ext
+            import psycopg2.pool
+            for t in (np.int64, np.int32, np.float64):
+                ext.register_adapter(t, ext.AsIs)
+            _POOL = psycopg2.pool.ThreadedConnectionPool(
+                1, 6, DATABASE_URL, connect_timeout=15, keepalives=1, keepalives_idle=30,
+                keepalives_interval=10, keepalives_count=3)
+        return _POOL
+
+
+def _pg_checkout():
+    import psycopg2
+    pool = _pg_pool()
+    last = None
+    for _ in range(4):                       # hosted databases drop idle connections: test, replace if dead
+        raw = pool.getconn()
+        try:
+            if raw.closed:
+                raise psycopg2.OperationalError("connection closed")
+            with raw.cursor() as cur:
+                cur.execute("SELECT 1")
+            raw.rollback()
+            return raw
+        except psycopg2.Error as exc:
+            last = exc
+            pool.putconn(raw, close=True)
+    raise last
 
 
 @contextmanager
 def db():
-    conn = sqlite3.connect(DB_FILE, timeout=20)
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    if using_pg():
+        raw = _pg_checkout()
+        try:
+            yield _PgConn(raw)
+            raw.commit()
+        except Exception:
+            try:
+                raw.rollback()
+            except Exception:  # noqa: BLE001 - connection already gone
+                pass
+            raise
+        finally:
+            _pg_pool().putconn(raw, close=bool(raw.closed))
+    else:
+        conn = sqlite3.connect(DB_FILE, timeout=20)
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def audit(user: str, action: str, detail: str = "", conn=None):
-    sql = "INSERT INTO audit(ts, user, action, detail) VALUES (?,?,?,?)"
+    sql = "INSERT INTO audit(ts, by_user, action, detail) VALUES (?,?,?,?)"
     args = (now_iso(), user, action, detail)
     if conn is not None:
         conn.execute(sql, args)
@@ -315,8 +457,8 @@ def _insert_staff(c, station, name, designation, belt, contact):
         return None
     cur = c.execute(
         "INSERT INTO staff(station, name, designation, belt_no, contact, active, created_at) "
-        "VALUES (?,?,?,?,?,1,?)", (station, name, designation, belt, contact, now_iso()))
-    return cur.lastrowid
+        "VALUES (?,?,?,?,?,1,?) RETURNING id", (station, name, designation, belt, contact, now_iso()))
+    return cur.fetchone()[0]
 
 
 def add_staff(station, name, designation, belt, contact, by):
@@ -699,7 +841,8 @@ def clear_roster(station, iso, by) -> int:
 def set_final(station, iso, final: bool, by):
     with db() as c:
         if final:
-            c.execute("INSERT OR REPLACE INTO roster_day(station, roster_date, by_user, at) VALUES (?,?,?,?)",
+            c.execute("INSERT INTO roster_day(station, roster_date, by_user, at) VALUES (?,?,?,?) "
+                      "ON CONFLICT(station, roster_date) DO UPDATE SET by_user=excluded.by_user, at=excluded.at",
                       (station, iso, by, now_iso()))
         else:
             _reopen(c, station, iso)
@@ -813,7 +956,7 @@ def get_signature(station: str) -> dict:
     with db() as c:
         row = c.execute("SELECT label, officer, image FROM signature WHERE station=?", (station,)).fetchone()
     label, officer, img = (row or (None, None, None))
-    return {"label": label or default_label(station), "officer": officer or "", "image": img}
+    return {"label": label or default_label(station), "officer": officer or "", "image": bytes(img) if img else None}
 
 
 def save_signature(station, label, officer, by):
@@ -1138,44 +1281,66 @@ def build_excel(iso: str, stations) -> bytes:
 # =============================================================================
 # BACKUP / RESTORE / AUDIT
 # =============================================================================
+_BK_TABLES = ["users", "staff", "lists", "slots", "roster", "roster_day", "signature", "audit"]
+_BK_SERIAL = ["staff", "lists", "slots", "roster", "audit"]
+
+
 def backup_bytes() -> bytes:
-    fd, tmp = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        src, dst = sqlite3.connect(DB_FILE), sqlite3.connect(tmp)
-        src.backup(dst)
-        src.close()
-        dst.close()
-        with open(tmp, "rb") as f:
-            return f.read()
-    finally:
-        os.remove(tmp)
+    """Whole database as one readable JSON file (works for both SQLite and PostgreSQL)."""
+    import base64
+    import json
+    out = {"app": "duty_roster", "version": 3, "made": now_iso(), "tables": {}}
+    with db() as c:
+        for t in _BK_TABLES:
+            cur = c.execute(f"SELECT * FROM {t}")
+            cols = [d[0] for d in cur.description]
+            rows = [[{"b64": base64.b64encode(bytes(v)).decode()} if isinstance(v, (bytes, bytearray, memoryview)) else v
+                     for v in r] for r in cur.fetchall()]
+            out["tables"][t] = {"cols": cols, "rows": rows}
+    return json.dumps(out).encode("utf-8")
 
 
 def restore_backup(data: bytes):
-    fd, tmp = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
+    import base64
+    import json
     try:
-        with open(tmp, "wb") as f:
-            f.write(data)
-        try:
-            chk = sqlite3.connect(tmp)
-            tables = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            chk.close()
-        except sqlite3.DatabaseError:
-            return False, "That file is not a valid backup."
-        if not {"users", "staff", "roster", "lists", "slots"} <= tables:
-            return False, "That file is not a backup of this app."
-        shutil.copyfile(tmp, DB_FILE)
-    finally:
-        os.remove(tmp)
+        obj = json.loads(data.decode("utf-8"))
+        tables = obj["tables"]
+        assert isinstance(tables, dict)
+    except Exception:  # noqa: BLE001
+        return False, "That file is not a valid backup."
+    if obj.get("app") != "duty_roster" or not {"users", "staff", "roster", "lists", "slots"} <= set(tables):
+        return False, "That file is not a backup of this app."
+    try:
+        with db() as c:
+            for t in reversed(_BK_TABLES):
+                c.execute(f"DELETE FROM {t}")
+            for t in _BK_TABLES:
+                spec = tables.get(t)
+                if not spec:
+                    continue
+                real = [d[0] for d in c.execute(f"SELECT * FROM {t} LIMIT 0").description]
+                keep = [i for i, col in enumerate(spec["cols"]) if col in real]   # only our own column names
+                if not keep:
+                    continue
+                names = ",".join(spec["cols"][i] for i in keep)
+                mark = ",".join("?" * len(keep))
+                for row in spec["rows"]:
+                    vals = [base64.b64decode(row[i]["b64"]) if isinstance(row[i], dict) else row[i] for i in keep]
+                    c.execute(f"INSERT INTO {t}({names}) VALUES ({mark})", vals)
+            if using_pg():
+                for t in _BK_SERIAL:
+                    c.execute(f"SELECT setval(pg_get_serial_sequence('{t}','id'), "
+                              f"COALESCE((SELECT MAX(id) FROM {t}),0)+1, false)")
+    except Exception as exc:  # noqa: BLE001 - whole restore rolls back
+        return False, f"Restore failed, nothing was changed: {exc}"
     init_db()
     return True, "Backup restored."
 
 
 def get_audit(limit: int = 300) -> pd.DataFrame:
     with db() as c:
-        return pd.read_sql_query("SELECT ts AS time, user, action, detail FROM audit ORDER BY id DESC LIMIT ?",
+        return pd.read_sql_query("SELECT ts AS time, by_user AS \"user\", action, detail FROM audit ORDER BY id DESC LIMIT ?",
                                  c, params=(limit,))
 
 
@@ -1217,7 +1382,16 @@ def _seed_from_excel(c):
 
 
 def _run_schema(conn) -> None:
-    """Run SCHEMA one statement at a time so a failure names the exact statement."""
+    """Run the schema one statement at a time so a failure names the exact statement."""
+    if using_pg():
+        conn.execute("SELECT pg_advisory_xact_lock(727201)")    # two app instances may start together
+        stmts = [x.strip() for x in SCHEMA_PG.split(";") if x.strip()]
+        for st_ in stmts:
+            try:
+                conn.execute(st_)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"{exc} | statement: {' '.join(st_.split())[:160]}") from exc
+        return
     buf = ""
     for line in SCHEMA.splitlines(keepends=True):
         buf += line
@@ -1232,19 +1406,21 @@ def _run_schema(conn) -> None:
 
 def diagnostics() -> str:
     """Plain-text facts for the on-screen error box (the host hides the real exception)."""
+    if using_pg():
+        host = re.sub(r"^.*@", "", DATABASE_URL.split("?")[0])
+        return f"Backend=PostgreSQL | target={host}"
     try:
         size = os.path.getsize(DB_FILE) if os.path.exists(DB_FILE) else None
     except OSError:
         size = "?"
-    return (f"SQLite {sqlite3.sqlite_version} | db={DB_FILE} | exists_size={size} | "
-            f"dir_writable={os.access(os.path.dirname(DB_FILE) or '.', os.W_OK)} | "
-            f"core.py={os.path.abspath(__file__)}")
+    return (f"Backend=SQLite {sqlite3.sqlite_version} | db={DB_FILE} | exists_size={size} | "
+            f"dir_writable={os.access(os.path.dirname(DB_FILE) or '.', os.W_OK)}")
 
 
 def _expected_columns() -> dict:
     """Tables and columns that SCHEMA defines, read from a throw-away in-memory database."""
     m = sqlite3.connect(":memory:")
-    _run_schema(m)
+    m.executescript(SCHEMA)
     out = {t: {r[1] for r in m.execute(f"PRAGMA table_info({t})")}
            for (t,) in m.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
     m.close()
@@ -1283,6 +1459,8 @@ def init_db() -> bool:
     """Start-up with self-repair: a database the app cannot use is set aside and rebuilt,
     and an unwritable folder (some cloud hosts) falls back to the system temp folder."""
     global DB_FILE
+    if using_pg():
+        return _init_db_once()
     for attempt in range(3):
         try:
             _set_aside_legacy_db()

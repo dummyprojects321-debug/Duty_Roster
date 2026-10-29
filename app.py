@@ -16,6 +16,16 @@ from datetime import date, datetime, time, timedelta
 import pandas as pd
 import streamlit as st
 
+# Permanent database: put DATABASE_URL in Streamlit "Secrets" (see README). Must happen before `import core`.
+import os
+
+try:
+    _url = st.secrets.get("DATABASE_URL", "")
+    if _url:
+        os.environ["DATABASE_URL"] = str(_url)
+except Exception:  # noqa: BLE001 - no secrets configured: fall back to the local SQLite file
+    pass
+
 import core
 from core import nice
 
@@ -772,11 +782,16 @@ def page_admin_tools(user, iso):
                 bump()
                 st.rerun()
     with t_bk:
-        st.markdown("**Backup** - download regularly, especially if the app runs on a host that can reset its disk.")
+        if core.using_pg():
+            st.success("Data is stored in a permanent PostgreSQL database and survives restarts.")
+        else:
+            st.warning("Running on a temporary SQLite file: on Streamlit Cloud ALL data is lost on every restart. "
+                       "Add DATABASE_URL in Secrets to switch to a permanent database.")
+        st.markdown("**Backup** - an extra safety copy; download it now and then.")
         st.download_button("⬇️ Download backup", core.backup_bytes(),
-                           f"duty_roster_backup_{datetime.now():%Y%m%d_%H%M}.db", "application/octet-stream")
+                           f"duty_roster_backup_{datetime.now():%Y%m%d_%H%M}.json", "application/json")
         st.markdown("**Restore** - replaces ALL current data with the backup file.")
-        up = st.file_uploader("Backup file (.db)", type=["db"], key=f"restore_{ver}")
+        up = st.file_uploader("Backup file (.json)", type=["json"], key=f"restore_{ver}")
         sure = st.checkbox("I understand this replaces everything and signs everyone out")
         if st.button("Restore backup", disabled=not (up and sure)):
             ok, msg = core.restore_backup(up.getvalue())
