@@ -35,7 +35,7 @@ import pandas as pd
 # CONFIG  (safe to edit)
 # =============================================================================
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.environ.get("DUTY_DB_PATH", os.path.join(HERE, "duty_roster.db"))
+DB_FILE = os.environ.get("DUTY_DB_PATH", os.path.join(HERE, "duty_roster_v3.db"))
 SEED_FILE = os.path.join(HERE, "DUTY_ROSTER_Standard.xlsx")  # used once, on an empty database
 ORG_NAME = "PERA  |  DERB Gujranwala"
 APP_TITLE = "Duty Roster"
@@ -1216,7 +1216,24 @@ def _seed_from_excel(c):
             _upsert(c, stn, today_iso(), sid, "Duty", beat, shift, slot, squad, "seed")
 
 
+def _set_aside_legacy_db():
+    """An old-format database (e.g. from the previous app version) is renamed, never overwritten."""
+    if not os.path.exists(DB_FILE):
+        return
+    try:
+        chk = sqlite3.connect(DB_FILE)
+        tables = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        cols = {r[1] for r in chk.execute("PRAGMA table_info(users)")} if "users" in tables else set()
+        chk.close()
+    except sqlite3.DatabaseError:
+        tables, cols = {"?"}, set()
+    legacy = "employees" in tables or ("users" in tables and "role" not in cols) or tables == {"?"}
+    if legacy:
+        shutil.move(DB_FILE, f"{DB_FILE}.legacy-{datetime.now():%Y%m%d%H%M%S}")
+
+
 def init_db() -> bool:
+    _set_aside_legacy_db()
     with db() as c:
         c.executescript(SCHEMA)
         if not c.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():

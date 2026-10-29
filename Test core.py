@@ -148,6 +148,30 @@ def test_add_station():
     assert core.get_list("shift", "SAMBRIAL") == core.DEFAULT_SHIFTS
 
 
+def test_old_format_database_is_set_aside():
+    import sqlite3, glob
+    path = os.path.join(tempfile.mkdtemp(), "old.db")
+    old = sqlite3.connect(path)       # what the previous app version created
+    old.executescript("CREATE TABLE users(username TEXT PRIMARY KEY, salt TEXT, pw_hash TEXT);"
+                      "CREATE TABLE roster(id INTEGER PRIMARY KEY, station TEXT, name TEXT);"
+                      "CREATE TABLE employees(id INTEGER PRIMARY KEY, name TEXT);"
+                      "INSERT INTO users VALUES('MASTER_ADMIN','aa','bb');")
+    old.commit(); old.close()
+    saved = core.DB_FILE
+    core.DB_FILE = path
+    try:
+        core.init_db()
+        assert core.authenticate("ADMIN", core.DEFAULT_ADMIN_PW)["role"] == "admin"
+        assert len(glob.glob(path + ".legacy-*")) == 1          # old data kept, not deleted
+        core.init_db()                                           # second start changes nothing
+        assert len(glob.glob(path + ".legacy-*")) == 1
+        open(path, "wb").write(b"this is not sqlite at all" * 10)  # corrupt file
+        core.init_db()
+        assert core.list_stations()
+    finally:
+        core.DB_FILE = saved
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
