@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 """
 Duty Roster Command Center
 --------------------------
@@ -1415,4 +1415,4 @@ with tab3:
   )
 
 conn.close()
->>>>>>> 181bf0c6b3e141b6691b138b745015602f522b93
+
