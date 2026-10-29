@@ -1,4 +1,10 @@
+<<<<<<< HEAD
 streamlit>=1.50.0
 pandas>=2.0
 openpyxl>=3.1
 reportlab>=4.0
+=======
+streamlit
+pandas
+openpyxl
+>>>>>>> 181bf0c6b3e141b6691b138b745015602f522b93
